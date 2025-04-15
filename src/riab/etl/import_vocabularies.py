@@ -176,11 +176,11 @@ class ImportVocabularies(EtlBase, ABC):
         df_vocabulary_table = pl.read_csv(
             csv_file, separator="\t",
             quote_char=None,
-            escape_char=None,
             try_parse_dates=True,
             schema=polars_schema,
             encoding="utf-8",
-            ignore_errors=False
+            ignore_errors=False,
+            infer_schema_length=0
         )
 
         date_columns = self._df_omop_fields.filter(
