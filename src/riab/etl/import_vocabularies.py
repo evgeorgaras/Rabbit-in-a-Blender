@@ -172,8 +172,15 @@ class ImportVocabularies(EtlBase, ABC):
             pl.DataFrame: The CSV converted in an data frame
         """
         polars_schema = self._get_polars_schema_for_cdm_table(vocabulary_table)
+        
         df_vocabulary_table = pl.read_csv(
-            csv_file, separator="\t", try_parse_dates=True, schema=polars_schema, encoding="utf-8"
+            csv_file, separator="\t",
+            quote_char=None,
+            escape_char=None,
+            try_parse_dates=True,
+            schema=polars_schema,
+            encoding="utf-8",
+            ignore_errors=False
         )
 
         date_columns = self._df_omop_fields.filter(
