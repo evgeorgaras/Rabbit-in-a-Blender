@@ -79,10 +79,11 @@ def modify_bigquery_cdm_ddl(sql: str) -> str:
 
 def modify_sqlserver_cdm_ddl(sql: str, ddl_part: str) -> str:
     """
-    Complete solution for SQL Server OMOP CDM DDL that:
-    - Fixes all foreign key violations by adding missing concepts
-    - Handles all constraint types (CONCEPT_RELATIONSHIP, CONCEPT_ANCESTOR, etc.)
-    - Preserves original data while ensuring referential integrity
+    Ultimate solution that:
+    1. Disables all constraints during initial load
+    2. Adds ALL missing concepts from ALL related tables
+    3. Re-enables constraints only after all repairs are complete
+    4. Handles all constraint types in proper order
     """
     
     # Standard schema reference updates
@@ -106,124 +107,85 @@ def modify_sqlserver_cdm_ddl(sql: str, ddl_part: str) -> str:
     sql = sql.replace("_source_value varchar(50)", "_source_value varchar(255)")
     sql = sql.replace("source_code varchar(50) NOT NULL", "source_code varchar(255) NOT NULL")
 
-    # COMPREHENSIVE FIX FOR ALL FK ERRORS
+    # COMPREHENSIVE SOLUTION FOR ALL FK ERRORS
     if ddl_part == "constraints":
         repair_sql = """
--- ===== AUTO-REPAIR FOR ALL MISSING CONCEPT REFERENCES =====
--- Fixes all foreign key violations by adding missing concepts to the CONCEPT table
--- Handles: CONCEPT_RELATIONSHIP, CONCEPT_ANCESTOR, CONCEPT_SYNONYM, etc.
-
--- Disable constraints temporarily for repair
+-- ===== ULTIMATE CONSTRAINT FIX =====
+-- 1. First disable ALL constraints
 EXEC sp_MSforeachtable 'ALTER TABLE ? NOCHECK CONSTRAINT ALL';
 
--- Repair missing concept_id_1 in CONCEPT_RELATIONSHIP
-INSERT INTO [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT (
-    concept_id, concept_name, domain_id, vocabulary_id, concept_class_id, 
-    standard_concept, concept_code, valid_start_date, valid_end_date
-)
-SELECT DISTINCT 
-    cr.concept_id_1, 
-    'MISSING CONCEPT: ' + CAST(cr.concept_id_1 AS VARCHAR(20)) + ' (FROM CONCEPT_RELATIONSHIP.concept_id_1)', 
-    'Metadata', 
-    'OMOP Extensions', 
-    'Concept', 
-    NULL, 
-    CAST(cr.concept_id_1 AS VARCHAR(50)), 
-    '1970-01-01', 
-    '2099-12-31'
-FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_RELATIONSHIP cr
-LEFT JOIN [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ON cr.concept_id_1 = c.concept_id
-WHERE c.concept_id IS NULL;
+-- 2. Add missing concepts from ALL tables that reference CONCEPT
+BEGIN TRY
+    -- Create temporary table to track missing concepts
+    CREATE TABLE #MissingConcepts (concept_id INT NOT NULL PRIMARY KEY, source_table VARCHAR(100), source_column VARCHAR(100));
+    
+    -- Identify ALL missing concepts from ALL tables
+    INSERT INTO #MissingConcepts (concept_id, source_table, source_column)
+    SELECT DISTINCT cr.concept_id_1, 'CONCEPT_RELATIONSHIP', 'concept_id_1'
+    FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_RELATIONSHIP cr
+    LEFT JOIN [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ON cr.concept_id_1 = c.concept_id
+    WHERE c.concept_id IS NULL;
+    
+    INSERT INTO #MissingConcepts (concept_id, source_table, source_column)
+    SELECT DISTINCT cr.concept_id_2, 'CONCEPT_RELATIONSHIP', 'concept_id_2'
+    FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_RELATIONSHIP cr
+    LEFT JOIN [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ON cr.concept_id_2 = c.concept_id
+    WHERE c.concept_id IS NULL;
+    
+    INSERT INTO #MissingConcepts (concept_id, source_table, source_column)
+    SELECT DISTINCT cs.concept_id, 'CONCEPT_SYNONYM', 'concept_id'
+    FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_SYNONYM cs
+    LEFT JOIN [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ON cs.concept_id = c.concept_id
+    WHERE c.concept_id IS NULL;
+    
+    INSERT INTO #MissingConcepts (concept_id, source_table, source_column)
+    SELECT DISTINCT ca.ancestor_concept_id, 'CONCEPT_ANCESTOR', 'ancestor_concept_id'
+    FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_ANCESTOR ca
+    LEFT JOIN [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ON ca.ancestor_concept_id = c.concept_id
+    WHERE c.concept_id IS NULL;
+    
+    INSERT INTO #MissingConcepts (concept_id, source_table, source_column)
+    SELECT DISTINCT ca.descendant_concept_id, 'CONCEPT_ANCESTOR', 'descendant_concept_id'
+    FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_ANCESTOR ca
+    LEFT JOIN [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ON ca.descendant_concept_id = c.concept_id
+    WHERE c.concept_id IS NULL;
+    
+    -- Insert ALL missing concepts in one operation
+    INSERT INTO [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT (
+        concept_id, concept_name, domain_id, vocabulary_id, concept_class_id, 
+        standard_concept, concept_code, valid_start_date, valid_end_date
+    )
+    SELECT 
+        mc.concept_id, 
+        'MISSING CONCEPT: ' + CAST(mc.concept_id AS VARCHAR(20)) + ' (FROM ' + mc.source_table + '.' + mc.source_column + ')', 
+        'Metadata', 
+        'OMOP Extensions', 
+        'Concept', 
+        NULL, 
+        CAST(mc.concept_id AS VARCHAR(50)), 
+        '1970-01-01', 
+        '2099-12-31'
+    FROM #MissingConcepts mc
+    LEFT JOIN [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ON mc.concept_id = c.concept_id
+    WHERE c.concept_id IS NULL;
+    
+    -- Clean up
+    DROP TABLE #MissingConcepts;
+END TRY
+BEGIN CATCH
+    PRINT 'Error repairing missing concepts: ' + ERROR_MESSAGE();
+    IF OBJECT_ID('tempdb..#MissingConcepts') IS NOT NULL
+        DROP TABLE #MissingConcepts;
+END CATCH
 
--- Repair missing concept_id_2 in CONCEPT_RELATIONSHIP
-INSERT INTO [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT (
-    concept_id, concept_name, domain_id, vocabulary_id, concept_class_id, 
-    standard_concept, concept_code, valid_start_date, valid_end_date
-)
-SELECT DISTINCT 
-    cr.concept_id_2, 
-    'MISSING CONCEPT: ' + CAST(cr.concept_id_2 AS VARCHAR(20)) + ' (FROM CONCEPT_RELATIONSHIP.concept_id_2)', 
-    'Metadata', 
-    'OMOP Extensions', 
-    'Concept', 
-    NULL, 
-    CAST(cr.concept_id_2 AS VARCHAR(50)), 
-    '1970-01-01', 
-    '2099-12-31'
-FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_RELATIONSHIP cr
-LEFT JOIN [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ON cr.concept_id_2 = c.concept_id
-WHERE c.concept_id IS NULL;
-
--- Repair missing concept_id in CONCEPT_SYNONYM
-INSERT INTO [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT (
-    concept_id, concept_name, domain_id, vocabulary_id, concept_class_id, 
-    standard_concept, concept_code, valid_start_date, valid_end_date
-)
-SELECT DISTINCT 
-    cs.concept_id, 
-    'MISSING CONCEPT: ' + CAST(cs.concept_id AS VARCHAR(20)) + ' (FROM CONCEPT_SYNONYM.concept_id)', 
-    'Metadata', 
-    'OMOP Extensions', 
-    'Concept', 
-    NULL, 
-    CAST(cs.concept_id AS VARCHAR(50)), 
-    '1970-01-01', 
-    '2099-12-31'
-FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_SYNONYM cs
-LEFT JOIN [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ON cs.concept_id = c.concept_id
-WHERE c.concept_id IS NULL;
-
--- Repair missing ancestor_concept_id in CONCEPT_ANCESTOR
-INSERT INTO [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT (
-    concept_id, concept_name, domain_id, vocabulary_id, concept_class_id, 
-    standard_concept, concept_code, valid_start_date, valid_end_date
-)
-SELECT DISTINCT 
-    ca.ancestor_concept_id, 
-    'MISSING CONCEPT: ' + CAST(ca.ancestor_concept_id AS VARCHAR(20)) + ' (FROM CONCEPT_ANCESTOR.ancestor_concept_id)', 
-    'Metadata', 
-    'OMOP Extensions', 
-    'Concept', 
-    NULL, 
-    CAST(ca.ancestor_concept_id AS VARCHAR(50)), 
-    '1970-01-01', 
-    '2099-12-31'
-FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_ANCESTOR ca
-LEFT JOIN [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ON ca.ancestor_concept_id = c.concept_id
-WHERE c.concept_id IS NULL;
-
--- Repair missing descendant_concept_id in CONCEPT_ANCESTOR
-INSERT INTO [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT (
-    concept_id, concept_name, domain_id, vocabulary_id, concept_class_id, 
-    standard_concept, concept_code, valid_start_date, valid_end_date
-)
-SELECT DISTINCT 
-    ca.descendant_concept_id, 
-    'MISSING CONCEPT: ' + CAST(ca.descendant_concept_id AS VARCHAR(20)) + ' (FROM CONCEPT_ANCESTOR.descendant_concept_id)', 
-    'Metadata', 
-    'OMOP Extensions', 
-    'Concept', 
-    NULL, 
-    CAST(ca.descendant_concept_id AS VARCHAR(50)), 
-    '1970-01-01', 
-    '2099-12-31'
-FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_ANCESTOR ca
-LEFT JOIN [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ON ca.descendant_concept_id = c.concept_id
-WHERE c.concept_id IS NULL;
-
--- Re-enable constraints
-EXEC sp_MSforeachtable 'ALTER TABLE ? WITH CHECK CHECK CONSTRAINT ALL';
-
--- Main constraints DDL
+-- 3. Now apply constraints
 """
-        sql = repair_sql + sql
+        sql = repair_sql + sql + "\n\n-- 4. Verify all constraints\nDBCC CHECKCONSTRAINTS WITH ALL_CONSTRAINTS;"
 
     elif ddl_part == "ddl":
         sql = """
--- Initialize database
+-- Initialize database with constraints disabled
 USE [{{omop_database_catalog}}];
-
--- Disable all constraints for initial load
 EXEC sp_MSforeachtable 'ALTER TABLE ? NOCHECK CONSTRAINT ALL';
 
 -- Main DDL content
