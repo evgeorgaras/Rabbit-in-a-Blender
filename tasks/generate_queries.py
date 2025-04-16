@@ -78,251 +78,44 @@ def modify_bigquery_cdm_ddl(sql: str) -> str:
 
 
 def modify_sqlserver_cdm_ddl(sql: str, ddl_part: str) -> str:
-    # ... (keep existing schema and varchar length replacements)
-
-    if ddl_part == "constraints":
-        sql = """
--- ===================================================================
--- PHASE 1: Create missing placeholder concepts with detailed logging
--- ===================================================================
-DECLARE @AddedConcepts TABLE (concept_id INT, source_table VARCHAR(50), source_column VARCHAR(50), records_affected INT);
-DECLARE @LogMessage NVARCHAR(MAX) = '';
-
--- Find all missing concepts from all tables first
-WITH MissingConcepts AS (
-    -- From CONCEPT_RELATIONSHIP.concept_id_1
-    SELECT DISTINCT cr.concept_id_1 as concept_id, 
-           'CONCEPT_RELATIONSHIP' as source_table, 
-           'concept_id_1' as source_column,
-           COUNT(*) as records_affected
-    FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_RELATIONSHIP cr
-    WHERE NOT EXISTS (
-        SELECT 1 FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c 
-        WHERE c.concept_id = cr.concept_id_1
+    # Solve some issues with the DDL
+    sql = re.sub(
+        r"@cdmDatabaseSchema",
+        r"[{{omop_database_catalog}}].[{{omop_database_schema}}]",
+        sql,
     )
-    AND cr.concept_id_1 IS NOT NULL
-    GROUP BY cr.concept_id_1
-    
-    UNION
-    
-    -- From CONCEPT_RELATIONSHIP.concept_id_2
-    SELECT DISTINCT cr.concept_id_2 as concept_id, 
-           'CONCEPT_RELATIONSHIP' as source_table, 
-           'concept_id_2' as source_column,
-           COUNT(*) as records_affected
-    FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_RELATIONSHIP cr
-    WHERE NOT EXISTS (
-        SELECT 1 FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c 
-        WHERE c.concept_id = cr.concept_id_2
+    sql = re.sub(
+        r"(CREATE TABLE \[{{omop_database_catalog}}\].\[{{omop_database_schema}}\]).(.*).(\([\S\s.]+?\);)",
+        r"IF OBJECT_ID(N'[{{omop_database_catalog}}].[{{omop_database_schema}}].\2', N'U') IS NOT NULL\n\tDROP TABLE [{{omop_database_catalog}}].[{{omop_database_schema}}].\2; \n\1.\2 \3",
+        sql,
     )
-    AND cr.concept_id_2 IS NOT NULL
-    GROUP BY cr.concept_id_2
+    # see https://github.com/OHDSI/Vocabulary-v5.0/issues/389#issuecomment-1977413290
+    sql = sql.replace("concept_name varchar(255) NOT NULL,", "concept_name varchar(510) NOT NULL,")
+    sql = sql.replace("concept_synonym_name varchar(1000) NOT NULL,", "concept_synonym_name varchar(1100) NOT NULL,")
+    sql = sql.replace("vocabulary_name varchar(255) NOT NULL,", "vocabulary_name varchar(510) NOT NULL,")
     
-    UNION
+    # deviation from OMOP CDM 5.4 change the length of source_value columns from 50 chars to 255 (see https://github.com/RADar-AZDelta/Rabbit-in-a-Blender/issues/71)
+    sql = sql.replace("_source_value varchar(50)", "_source_value varchar(255)")
+
+    # also change length of the source_code
+    sql = sql.replace("source_code varchar(50) NOT NULL", "source_code varchar(255) NOT NULL")
     
-    -- From CONCEPT_SYNONYM
-    SELECT DISTINCT cs.concept_id, 
-           'CONCEPT_SYNONYM' as source_table, 
-           'concept_id' as source_column,
-           COUNT(*) as records_affected
-    FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_SYNONYM cs
-    WHERE NOT EXISTS (
-        SELECT 1 FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c 
-        WHERE c.concept_id = cs.concept_id
-    )
-    AND cs.concept_id IS NOT NULL
-    GROUP BY cs.concept_id
-    
-    UNION
-    
-    -- From CONCEPT_ANCESTOR (ancestor)
-    SELECT DISTINCT ca.ancestor_concept_id as concept_id, 
-           'CONCEPT_ANCESTOR' as source_table, 
-           'ancestor_concept_id' as source_column,
-           COUNT(*) as records_affected
-    FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_ANCESTOR ca
-    WHERE NOT EXISTS (
-        SELECT 1 FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c 
-        WHERE c.concept_id = ca.ancestor_concept_id
-    )
-    AND ca.ancestor_concept_id IS NOT NULL
-    GROUP BY ca.ancestor_concept_id
-    
-    UNION
-    
-    -- From CONCEPT_ANCESTOR (descendant)
-    SELECT DISTINCT ca.descendant_concept_id as concept_id, 
-           'CONCEPT_ANCESTOR' as source_table, 
-           'descendant_concept_id' as source_column,
-           COUNT(*) as records_affected
-    FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_ANCESTOR ca
-    WHERE NOT EXISTS (
-        SELECT 1 FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c 
-        WHERE c.concept_id = ca.descendant_concept_id
-    )
-    AND ca.descendant_concept_id IS NOT NULL
-    GROUP BY ca.descendant_concept_id
-)
+    if ddl_part == "ddl":
+        sql = (
+            """
+-- use database
+USE [{{omop_database_catalog}}];
 
--- Insert all missing concepts at once
-INSERT INTO [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT (
-    concept_id, concept_name, domain_id, vocabulary_id, concept_class_id, 
-    standard_concept, concept_code, valid_start_date, valid_end_date, invalid_reason
-)
-OUTPUT INSERTED.concept_id, src.source_table, src.source_column, src.records_affected INTO @AddedConcepts
-SELECT 
-    mc.concept_id,
-    'Placeholder for missing concept ' + CAST(mc.concept_id AS VARCHAR) + 
-    ' (referenced in ' + mc.source_table + '.' + mc.source_column + 
-    ' by ' + CAST(mc.records_affected AS VARCHAR) + ' records)' as concept_name,
-    'Metadata' as domain_id,
-    'Vocabulary' as vocabulary_id,
-    'Concept' as concept_class_id,
-    NULL as standard_concept,
-    'OMOP generated' as concept_code,
-    CAST('1970-01-01' AS DATE) as valid_start_date,
-    CAST('2099-12-31' AS DATE) as valid_end_date,
-    NULL as invalid_reason
-FROM MissingConcepts mc
-WHERE NOT EXISTS (
-    SELECT 1 FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c 
-    WHERE c.concept_id = mc.concept_id
-);
-
--- Generate comprehensive log message
-SELECT @LogMessage = @LogMessage + 
-    'Added placeholder concept ' + CAST(concept_id AS VARCHAR) + 
-    ' (referenced in ' + source_table + '.' + source_column + 
-    ' by ' + CAST(records_affected AS VARCHAR) + ' records)' + CHAR(13) + CHAR(10)
-FROM @AddedConcepts
-ORDER BY records_affected DESC, source_table, source_column, concept_id;
-
-IF @LogMessage <> ''
-BEGIN
-    DECLARE @TotalPlaceholders INT;
-    SELECT @TotalPlaceholders = COUNT(*) FROM @AddedConcepts;
-    
-    PRINT '===================================================================';
-    PRINT 'ADDED ' + CAST(@TotalPlaceholders AS VARCHAR) + ' PLACEHOLDER CONCEPTS';
-    PRINT '===================================================================';
-    PRINT @LogMessage;
-END
-ELSE
-BEGIN
-    PRINT 'No missing concepts found - all references are valid';
-END
-
--- ===================================================================
--- PHASE 2: Create constraints WITH NOCHECK to bypass validation
--- ===================================================================
-PRINT 'Creating constraints WITH NOCHECK to bypass immediate validation';
-
-""" + re.sub(
-    r"(ALTER TABLE \[{{omop_database_catalog}}\].\[{{omop_database_schema}}\].\w+ ADD CONSTRAINT \w+ FOREIGN KEY)",
-    r"\1 WITH NOCHECK",
-    sql
-) + """
-
--- ===================================================================
--- PHASE 3: Validate all constraints and report issues
--- ===================================================================
-PRINT 'Validating constraints...';
-
-DECLARE @ConstraintName NVARCHAR(128);
-DECLARE @TableName NVARCHAR(128);
-DECLARE @ValidationSQL NVARCHAR(MAX);
-DECLARE @ErrorCount INT;
-
-DECLARE ConstraintCursor CURSOR FOR
-SELECT name, OBJECT_NAME(parent_object_id)
+-- drop constraints
+DECLARE @DropConstraints NVARCHAR(max) = ''
+SELECT @DropConstraints += 'ALTER TABLE ' + QUOTENAME(OBJECT_SCHEMA_NAME(parent_object_id)) + '.'
+                        +  QUOTENAME(OBJECT_NAME(parent_object_id)) + ' ' + 'DROP CONSTRAINT' + QUOTENAME(name)
 FROM sys.foreign_keys
-WHERE is_not_trusted = 1
-AND OBJECT_NAME(referenced_object_id) = 'CONCEPT';
-
-OPEN ConstraintCursor;
-FETCH NEXT FROM ConstraintCursor INTO @ConstraintName, @TableName;
-
-WHILE @@FETCH_STATUS = 0
-BEGIN
-    SET @ValidationSQL = 'ALTER TABLE [{{omop_database_catalog}}].[{{omop_database_schema}}].' + QUOTENAME(@TableName) + 
-                         ' WITH CHECK CHECK CONSTRAINT ' + QUOTENAME(@ConstraintName);
-    
-    BEGIN TRY
-        EXEC sp_executesql @ValidationSQL;
-        PRINT 'Successfully validated constraint: ' + @ConstraintName;
-    END TRY
-    BEGIN CATCH
-        SET @ErrorCount = (SELECT COUNT(*) FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].[' + @TableName + '] t
-                          WHERE NOT EXISTS (
-                              SELECT 1 FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c 
-                              WHERE c.concept_id = t.' + 
-                              CASE @ConstraintName
-                                  WHEN 'fpk_CONCEPT_RELATIONSHIP_concept_id_1' THEN 'concept_id_1'
-                                  WHEN 'fpk_CONCEPT_RELATIONSHIP_concept_id_2' THEN 'concept_id_2'
-                                  WHEN 'fpk_CONCEPT_SYNONYM_concept_id' THEN 'concept_id'
-                                  WHEN 'fpk_CONCEPT_ANCESTOR_ancestor_concept_id' THEN 'ancestor_concept_id'
-                                  WHEN 'fpk_CONCEPT_ANCESTOR_descendant_concept_id' THEN 'descendant_concept_id'
-                                  ELSE 'concept_id'
-                              END + '
-                          ));
-        
-        PRINT 'WARNING: Constraint ' + @ConstraintName + ' on table ' + @TableName + 
-              ' has ' + CAST(@ErrorCount AS VARCHAR) + ' violations that could not be resolved';
-        
-        -- Generate detailed error report
-        IF @ErrorCount > 0
-        BEGIN
-            DECLARE @ErrorReport NVARCHAR(MAX) = 'Violations for ' + @ConstraintName + ':' + CHAR(13) + CHAR(10);
-            
-            SET @ValidationSQL = 'SELECT TOP 50 ''' + @TableName + ''' as table_name, ' +
-                               CASE @ConstraintName
-                                   WHEN 'fpk_CONCEPT_RELATIONSHIP_concept_id_1' THEN 'concept_id_1'
-                                   WHEN 'fpk_CONCEPT_RELATIONSHIP_concept_id_2' THEN 'concept_id_2'
-                                   WHEN 'fpk_CONCEPT_SYNONYM_concept_id' THEN 'concept_id'
-                                   WHEN 'fpk_CONCEPT_ANCESTOR_ancestor_concept_id' THEN 'ancestor_concept_id'
-                                   WHEN 'fpk_CONCEPT_ANCESTOR_descendant_concept_id' THEN 'descendant_concept_id'
-                                   ELSE 'concept_id'
-                               END + ' as invalid_concept_id, COUNT(*) as affected_records ' +
-                               'FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].[' + @TableName + '] t ' +
-                               'WHERE NOT EXISTS (SELECT 1 FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ' +
-                               'WHERE c.concept_id = t.' + 
-                               CASE @ConstraintName
-                                   WHEN 'fpk_CONCEPT_RELATIONSHIP_concept_id_1' THEN 'concept_id_1'
-                                   WHEN 'fpk_CONCEPT_RELATIONSHIP_concept_id_2' THEN 'concept_id_2'
-                                   WHEN 'fpk_CONCEPT_SYNONYM_concept_id' THEN 'concept_id'
-                                   WHEN 'fpk_CONCEPT_ANCESTOR_ancestor_concept_id' THEN 'ancestor_concept_id'
-                                   WHEN 'fpk_CONCEPT_ANCESTOR_descendant_concept_id' THEN 'descendant_concept_id'
-                                   ELSE 'concept_id'
-                               END + ') ' +
-                               'GROUP BY ' + 
-                               CASE @ConstraintName
-                                   WHEN 'fpk_CONCEPT_RELATIONSHIP_concept_id_1' THEN 'concept_id_1'
-                                   WHEN 'fpk_CONCEPT_RELATIONSHIP_concept_id_2' THEN 'concept_id_2'
-                                   WHEN 'fpk_CONCEPT_SYNONYM_concept_id' THEN 'concept_id'
-                                   WHEN 'fpk_CONCEPT_ANCESTOR_ancestor_concept_id' THEN 'ancestor_concept_id'
-                                   WHEN 'fpk_CONCEPT_ANCESTOR_descendant_concept_id' THEN 'descendant_concept_id'
-                                   ELSE 'concept_id'
-                               END + ' ORDER BY affected_records DESC';
-            
-            DECLARE @ErrorDetails TABLE (table_name NVARCHAR(128), invalid_concept_id INT, affected_records INT);
-            INSERT INTO @ErrorDetails EXEC sp_executesql @ValidationSQL;
-            
-            SELECT @ErrorReport = @ErrorReport + 
-                   '  - Concept ID: ' + CAST(invalid_concept_id AS VARCHAR) + 
-                   ' (affects ' + CAST(affected_records AS VARCHAR) + ' records)' + CHAR(13) + CHAR(10)
-            FROM @ErrorDetails;
-            
-            PRINT @ErrorReport;
-            PRINT 'First 50 violations shown. Total violations: ' + CAST(@ErrorCount AS VARCHAR);
-        END
-    END CATCH
-    
-    FETCH NEXT FROM ConstraintCursor INTO @ConstraintName, @TableName;
-END
-
-CLOSE ConstraintCursor;
-DEALLOCATE ConstraintCursor;
+EXECUTE sp_executesql @DropConstraints;
 """
+            + sql
+        )
+
     return sql
 
 
