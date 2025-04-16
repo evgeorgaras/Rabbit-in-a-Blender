@@ -78,118 +78,43 @@ def modify_bigquery_cdm_ddl(sql: str) -> str:
 
 
 def modify_sqlserver_cdm_ddl(sql: str, ddl_part: str) -> str:
-    """
-    Ultimate solution that:
-    1. Disables all constraints during initial load
-    2. Adds ALL missing concepts from ALL related tables
-    3. Re-enables constraints only after all repairs are complete
-    4. Handles all constraint types in proper order
-    """
-    
-    # Standard schema reference updates
+    # Solve some issues with the DDL
     sql = re.sub(
         r"@cdmDatabaseSchema",
         r"[{{omop_database_catalog}}].[{{omop_database_schema}}]",
         sql,
     )
-    
-    # Table creation with drop-if-exists
     sql = re.sub(
         r"(CREATE TABLE \[{{omop_database_catalog}}\].\[{{omop_database_schema}}\]).(.*).(\([\S\s.]+?\);)",
         r"IF OBJECT_ID(N'[{{omop_database_catalog}}].[{{omop_database_schema}}].\2', N'U') IS NOT NULL\n\tDROP TABLE [{{omop_database_catalog}}].[{{omop_database_schema}}].\2; \n\1.\2 \3",
         sql,
     )
-    
-    # Column length fixes
+    # see https://github.com/OHDSI/Vocabulary-v5.0/issues/389#issuecomment-1977413290
     sql = sql.replace("concept_name varchar(255) NOT NULL,", "concept_name varchar(510) NOT NULL,")
     sql = sql.replace("concept_synonym_name varchar(1000) NOT NULL,", "concept_synonym_name varchar(1100) NOT NULL,")
     sql = sql.replace("vocabulary_name varchar(255) NOT NULL,", "vocabulary_name varchar(510) NOT NULL,")
+    
+    # deviation from OMOP CDM 5.4 change the length of source_value columns from 50 chars to 255 (see https://github.com/RADar-AZDelta/Rabbit-in-a-Blender/issues/71)
     sql = sql.replace("_source_value varchar(50)", "_source_value varchar(255)")
+
+    # also change length of the source_code
     sql = sql.replace("source_code varchar(50) NOT NULL", "source_code varchar(255) NOT NULL")
-
-    # COMPREHENSIVE SOLUTION FOR ALL FK ERRORS
-    if ddl_part == "constraints":
-        repair_sql = """
--- ===== ULTIMATE CONSTRAINT FIX =====
--- 1. First disable ALL constraints
-EXEC sp_MSforeachtable 'ALTER TABLE ? NOCHECK CONSTRAINT ALL';
-
--- 2. Add missing concepts from ALL tables that reference CONCEPT
-BEGIN TRY
-    -- Create temporary table to track missing concepts
-    CREATE TABLE #MissingConcepts (concept_id INT NOT NULL PRIMARY KEY, source_table VARCHAR(100), source_column VARCHAR(100));
     
-    -- Identify ALL missing concepts from ALL tables
-    INSERT INTO #MissingConcepts (concept_id, source_table, source_column)
-    SELECT DISTINCT cr.concept_id_1, 'CONCEPT_RELATIONSHIP', 'concept_id_1'
-    FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_RELATIONSHIP cr
-    LEFT JOIN [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ON cr.concept_id_1 = c.concept_id
-    WHERE c.concept_id IS NULL;
-    
-    INSERT INTO #MissingConcepts (concept_id, source_table, source_column)
-    SELECT DISTINCT cr.concept_id_2, 'CONCEPT_RELATIONSHIP', 'concept_id_2'
-    FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_RELATIONSHIP cr
-    LEFT JOIN [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ON cr.concept_id_2 = c.concept_id
-    WHERE c.concept_id IS NULL;
-    
-    INSERT INTO #MissingConcepts (concept_id, source_table, source_column)
-    SELECT DISTINCT cs.concept_id, 'CONCEPT_SYNONYM', 'concept_id'
-    FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_SYNONYM cs
-    LEFT JOIN [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ON cs.concept_id = c.concept_id
-    WHERE c.concept_id IS NULL;
-    
-    INSERT INTO #MissingConcepts (concept_id, source_table, source_column)
-    SELECT DISTINCT ca.ancestor_concept_id, 'CONCEPT_ANCESTOR', 'ancestor_concept_id'
-    FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_ANCESTOR ca
-    LEFT JOIN [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ON ca.ancestor_concept_id = c.concept_id
-    WHERE c.concept_id IS NULL;
-    
-    INSERT INTO #MissingConcepts (concept_id, source_table, source_column)
-    SELECT DISTINCT ca.descendant_concept_id, 'CONCEPT_ANCESTOR', 'descendant_concept_id'
-    FROM [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT_ANCESTOR ca
-    LEFT JOIN [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ON ca.descendant_concept_id = c.concept_id
-    WHERE c.concept_id IS NULL;
-    
-    -- Insert ALL missing concepts in one operation
-    INSERT INTO [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT (
-        concept_id, concept_name, domain_id, vocabulary_id, concept_class_id, 
-        standard_concept, concept_code, valid_start_date, valid_end_date
-    )
-    SELECT 
-        mc.concept_id, 
-        'MISSING CONCEPT: ' + CAST(mc.concept_id AS VARCHAR(20)) + ' (FROM ' + mc.source_table + '.' + mc.source_column + ')', 
-        'Metadata', 
-        'OMOP Extensions', 
-        'Concept', 
-        NULL, 
-        CAST(mc.concept_id AS VARCHAR(50)), 
-        '1970-01-01', 
-        '2099-12-31'
-    FROM #MissingConcepts mc
-    LEFT JOIN [{{omop_database_catalog}}].[{{omop_database_schema}}].CONCEPT c ON mc.concept_id = c.concept_id
-    WHERE c.concept_id IS NULL;
-    
-    -- Clean up
-    DROP TABLE #MissingConcepts;
-END TRY
-BEGIN CATCH
-    PRINT 'Error repairing missing concepts: ' + ERROR_MESSAGE();
-    IF OBJECT_ID('tempdb..#MissingConcepts') IS NOT NULL
-        DROP TABLE #MissingConcepts;
-END CATCH
-
--- 3. Now apply constraints
-"""
-        sql = repair_sql + sql + "\n\n-- 4. Verify all constraints\nDBCC CHECKCONSTRAINTS WITH ALL_CONSTRAINTS;"
-
-    elif ddl_part == "ddl":
-        sql = """
--- Initialize database with constraints disabled
+    if ddl_part == "ddl":
+        sql = (
+            """
+-- use database
 USE [{{omop_database_catalog}}];
-EXEC sp_MSforeachtable 'ALTER TABLE ? NOCHECK CONSTRAINT ALL';
 
--- Main DDL content
-""" + sql
+-- drop constraints
+DECLARE @DropConstraints NVARCHAR(max) = ''
+SELECT @DropConstraints += 'ALTER TABLE ' + QUOTENAME(OBJECT_SCHEMA_NAME(parent_object_id)) + '.'
+                        +  QUOTENAME(OBJECT_NAME(parent_object_id)) + ' ' + 'DROP CONSTRAINT' + QUOTENAME(name)
+FROM sys.foreign_keys
+EXECUTE sp_executesql @DropConstraints;
+"""
+            + sql
+        )
 
     return sql
 
